@@ -1,0 +1,18 @@
+name: ddns-lambda
+runtime: nodejs
+description: DynDNS with AWS API Gateway
+template:
+  config:
+    aws:region:
+      description: The AWS region to deploy into
+      default: eu-central-1
+    ddns-lambda:domain: 
+      default: ddns.example.com
+    ddns-lambda:ttl: 
+      default: "60"
+    ddns-lambda:zoneid:
+      description: ZoneId for a reused hosted zone
+    ddns-lambda:user:
+      default: admin
+    ddns-lambda:passhash:
+      description: htpasswd -bnBC 10 "" changemepass | tr -d ':\n'

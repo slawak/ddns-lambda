@@ -1,0 +1,26 @@
+/.pulumi/
+/.vscode/
+/.vs/
+bin/
+build/
+node_modules/
+*.pyc
+.Python
+include/
+lib/
+yarn.lock
+package-lock.json
+Pulumi.*.yaml
+.idea/
+.ionide/
+*.iml
+key.rsa*
+obj/
+vendor
+Gopkg.lock
+
+# Java app
+.gradle/
+.settings/
+.project
+.classpath 
