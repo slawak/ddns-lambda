@@ -4,7 +4,6 @@ import * as awsx from "@pulumi/awsx";
 import * as bcryptjs from "bcryptjs";
 import * as _ from "lodash";
 import { isIPv4, isIPv6 } from "net";
-import { Output } from "@pulumi/pulumi";
 
 const config = new pulumi.Config();
 
@@ -65,6 +64,7 @@ const updateDnsRolePolicy = new aws.iam.RolePolicy("update-dns-role-policy", {
 const handler = new aws.lambda.CallbackFunction("update-dns-lambda-callback", {
   role: updateDnsRole,
   callback: async (event: awsx.apigateway.Request) => {
+    console.info("QUERY STRING PARAMETERS\n" + JSON.stringify(event.queryStringParameters, null, 2));
     const hostname = event.queryStringParameters?.hostname;
     const ip = event.queryStringParameters?.ip;
     const ip6 = event.queryStringParameters?.ip6;
@@ -130,6 +130,7 @@ const handler = new aws.lambda.CallbackFunction("update-dns-lambda-callback", {
           },
         })
         .promise();
+      console.info("CHANGED RECORD SET\n" + JSON.stringify(changedRecordSet, null, 2));
     }
 
     const currentRecords = await route53
@@ -150,17 +151,21 @@ const handler = new aws.lambda.CallbackFunction("update-dns-lambda-callback", {
       };
     }).filter((record) => record.name === `${hostname}.`);
 
+    const response = {
+      parameter: {
+        hostname: hostname,
+        ip: ip,
+        ip6: ip6,
+      },
+      action: action,
+      records: data,
+    };
+
+    console.info("RESPONSE\n" + JSON.stringify(response, null, 2));
+
     return {
       statusCode: 200,
-      body: JSON.stringify({
-        parameter: {
-          hostname: hostname,
-          ip: ip,
-          ip6: ip6,
-        },
-        action: action,
-        records: data,
-      }),
+      body: JSON.stringify(response),
     };
   },
 });
@@ -185,7 +190,7 @@ const endpoint = new awsx.apigateway.API("update-dns-lambda", {
             if (!authorizationHeader) throw new Error("Unauthorized");
 
             var encodedCreds = authorizationHeader.split(" ")[1];
-            var plainCreds = new Buffer(encodedCreds, "base64")
+            var plainCreds = Buffer.from(encodedCreds, "base64")
               .toString()
               .split(":");
             var username = plainCreds[0];
