@@ -4,6 +4,9 @@ import * as awsx from "@pulumi/awsx";
 import * as bcryptjs from "bcryptjs";
 import * as _ from "lodash";
 import { isIPv4, isIPv6 } from "net";
+import { Validator } from "ip-num/Validator";
+import { IPv6CidrRange } from "ip-num/IPRange";
+import { IPv6 } from "ip-num/IPNumber";
 
 const config = new pulumi.Config();
 
@@ -12,7 +15,7 @@ const domain = config.require("domain");
 const ttl = parseInt(config.require("ttl"));
 const user = config.require("user");
 // get the hash in plaintext
-const passhash = config.require("passhash");
+const passhashsecret = config.requireSecret("passhash");
 
 const updateDnsRole = new aws.iam.Role("update-dns-role", {
   assumeRolePolicy: JSON.stringify({
@@ -64,10 +67,14 @@ const updateDnsRolePolicy = new aws.iam.RolePolicy("update-dns-role-policy", {
 const handler = new aws.lambda.CallbackFunction("update-dns-lambda-callback", {
   role: updateDnsRole,
   callback: async (event: awsx.apigateway.Request) => {
-    console.info("QUERY STRING PARAMETERS\n" + JSON.stringify(event.queryStringParameters, null, 2));
+    console.info(
+      "QUERY STRING PARAMETERS\n" +
+        JSON.stringify(event.queryStringParameters, null, 2)
+    );
     const hostname = event.queryStringParameters?.hostname;
     const ip = event.queryStringParameters?.ip;
     const ip6 = event.queryStringParameters?.ip6;
+    const ip6lanprefix = event.queryStringParameters?.ip6lanprefix;
 
     if (!hostname)
       return {
@@ -98,11 +105,18 @@ const handler = new aws.lambda.CallbackFunction("update-dns-lambda-callback", {
           message: "parameter ip6 malformed",
         }),
       };
-    const action = ip || ip6 ? "UPDATE" : "GET";
+    if (ip6lanprefix && !Validator.isValidIPv6CidrRange(ip6lanprefix))
+      return {
+        statusCode: 404,
+        body: JSON.stringify({
+          message: "parameter ip6lanprefix malformed",
+        }),
+      };
+    const action = ip || ip6 || ip6lanprefix ? "UPDATE" : "GET";
 
     const route53 = new aws.sdk.Route53();
 
-    if (action === "UPDATE") {
+    if (ip || ip6) {
       const records = [
         { ip: ip, type: "A" },
         { ip: ip6, type: "AAAA" },
@@ -122,6 +136,7 @@ const handler = new aws.lambda.CallbackFunction("update-dns-lambda-callback", {
           },
         };
       });
+      console.info("CHANGED RECORD SET\n" + JSON.stringify(changes, null, 2));
       const changedRecordSet = await route53
         .changeResourceRecordSets({
           HostedZoneId: zoneId,
@@ -130,26 +145,76 @@ const handler = new aws.lambda.CallbackFunction("update-dns-lambda-callback", {
           },
         })
         .promise();
-      console.info("CHANGED RECORD SET\n" + JSON.stringify(changedRecordSet, null, 2));
+      console.info("CHANGE INFO\n" + JSON.stringify(changedRecordSet, null, 2));
     }
 
-    const currentRecords = await route53
+    if (ip6lanprefix) {
+      const ipv6range = IPv6CidrRange.fromCidr(ip6lanprefix);
+      const ipv6mask = ipv6range.cidrPrefix.toMask().value.not();
+      const ipv6rangeFirst = ipv6range.getFirst().value;
+      const currentRecords = await route53
+        .listResourceRecordSets({
+          HostedZoneId: zoneId,
+        })
+        .promise()
+        .then((resp) =>
+          resp.ResourceRecordSets.filter(
+            (record) =>
+              record.Type === "AAAA" &&
+              record.Name.includes(hostname) &&
+              record.Name != `${hostname}.`
+          )
+        );
+      const data = currentRecords.map((record) => {
+        const newResourceRecords = record.ResourceRecords?.map(
+          (recordValue) => {
+            const ipv6full = IPv6.fromHexadecimalString(recordValue.Value);
+            const ipv6interface = IPv6.fromBigInteger(
+              ipv6mask.and(ipv6full.value)
+            );
+            const ipv6new = IPv6.fromBigInteger(
+              ipv6rangeFirst.add(ipv6interface.value)
+            );
+            return { Value: ipv6new.toString() };
+          }
+        );
+        let newRecord = record;
+        newRecord.ResourceRecords = newResourceRecords;
+        return newRecord;
+      });
+
+      const changes = data
+        .filter((r) => r.Type === "AAAA")
+        .map((r) => {
+          return {
+            Action: "UPSERT",
+            ResourceRecordSet: r,
+          };
+        });
+      console.info("CHANGED RECORD SET\n" + JSON.stringify(changes, null, 2));
+      const changedRecordSet = await route53
+        .changeResourceRecordSets({
+          HostedZoneId: zoneId,
+          ChangeBatch: {
+            Changes: changes,
+          },
+        })
+        .promise();
+      console.info("CHANGE INFO\n" + JSON.stringify(changedRecordSet, null, 2));
+    }
+
+    const finalRecords = await route53
       .listResourceRecordSets({
         HostedZoneId: zoneId,
-        StartRecordName: hostname,
-        StartRecordType: "A",
-        MaxItems: "2",
       })
-      .promise();
-
-    const data = currentRecords.ResourceRecordSets.map((recordSet) => {
-      return {
-        name: recordSet.Name,
-        type: recordSet.Type,
-        ttl: recordSet.TTL,
-        value: recordSet.ResourceRecords?.map((v) => v.Value),
-      };
-    }).filter((record) => record.name === `${hostname}.`);
+      .promise()
+      .then((resp) =>
+        resp.ResourceRecordSets.filter(
+          (record) =>
+            (record.Type === "A" || record.Type === "AAAA") &&
+            record.Name.includes(hostname)
+        )
+      );
 
     const response = {
       parameter: {
@@ -158,7 +223,7 @@ const handler = new aws.lambda.CallbackFunction("update-dns-lambda-callback", {
         ip6: ip6,
       },
       action: action,
-      records: data,
+      records: finalRecords,
     };
 
     console.info("RESPONSE\n" + JSON.stringify(response, null, 2));
@@ -171,48 +236,54 @@ const handler = new aws.lambda.CallbackFunction("update-dns-lambda-callback", {
 });
 
 // Create an API endpoint
-const endpoint = new awsx.apigateway.API("update-dns-lambda", {
-  routes: [
-    {
-      path: "/updatedns.php",
-      method: "GET",
-      eventHandler: handler,
-      authorizers: [
+const endpoint = passhashsecret.apply(
+  (passhash) =>
+    new awsx.apigateway.API("update-dns-lambda", {
+      routes: [
         {
-          authorizerName: "basicAuthorizer",
-          parameterName: "auth",
-          parameterLocation: "header",
-          authType: "custom",
-          type: "request",
-          handler: async (event: awsx.apigateway.AuthorizerEvent) => {
-            var authorizationHeader = event.headers?.Authorization;
+          path: "/updatedns.php",
+          method: "GET",
+          eventHandler: handler,
+          authorizers: [
+            {
+              authorizerName: "basicAuthorizer",
+              parameterName: "auth",
+              parameterLocation: "header",
+              authType: "custom",
+              type: "request",
+              handler: async (event: awsx.apigateway.AuthorizerEvent) => {
+                var authorizationHeader = event.headers?.Authorization;
 
-            if (!authorizationHeader) throw new Error("Unauthorized");
+                if (!authorizationHeader) throw new Error("Unauthorized");
 
-            var encodedCreds = authorizationHeader.split(" ")[1];
-            var plainCreds = Buffer.from(encodedCreds, "base64")
-              .toString()
-              .split(":");
-            var username = plainCreds[0];
-            var password = plainCreds[1];
+                var encodedCreds = authorizationHeader.split(" ")[1];
+                var plainCreds = Buffer.from(encodedCreds, "base64")
+                  .toString()
+                  .split(":");
+                var username = plainCreds[0];
+                var password = plainCreds[1];
 
-            if (
-              !(username === user && bcryptjs.compareSync(password, passhash))
-            )
-              throw new Error("Unauthorized");
+                if (
+                  !(
+                    username === user &&
+                    bcryptjs.compareSync(password, passhash)
+                  )
+                )
+                  throw new Error("Unauthorized");
 
-            return awsx.apigateway.authorizerResponse(
-              "user",
-              "Allow",
-              event.methodArn
-            );
-          },
-          identitySource: ["method.request.header.Authorization"],
+                return awsx.apigateway.authorizerResponse(
+                  "user",
+                  "Allow",
+                  event.methodArn
+                );
+              },
+              identitySource: ["method.request.header.Authorization"],
+            },
+          ],
         },
       ],
-    },
-  ],
-});
+    })
+);
 
 const basicAuthResponse = new aws.apigateway.Response("basicAuthError", {
   responseParameters: {
