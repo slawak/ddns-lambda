@@ -189,7 +189,7 @@ const handler = new aws.lambda.CallbackFunction("update-dns-lambda-callback", {
       const ipv6range = IPv6CidrRange.fromCidr(ip6lanprefix);
       const ipv6mask = ipv6range.cidrPrefix.toMask().value.not();
       const ipv6rangeFirst = ipv6range.getFirst().value;
-      const currentRecords = await route53
+      const changesPromise = route53
         .listResourceRecordSets({
           HostedZoneId: zoneId,
         })
@@ -201,51 +201,59 @@ const handler = new aws.lambda.CallbackFunction("update-dns-lambda-callback", {
               record.Name.includes(hostname) &&
               record.Name != `${hostname}.`
           )
-        );
-      const data = currentRecords.map((record) => {
-        const newResourceRecords = record.ResourceRecords?.map(
-          (recordValue) => {
-            const ipv6full = IPv6.fromHexadecimalString(recordValue.Value);
-            const ipv6interface = IPv6.fromBigInteger(
-              ipv6mask.and(ipv6full.value)
+        )
+        .then((currentRecordsReponse) =>
+          currentRecordsReponse.map((record) => {
+            const newResourceRecords = record.ResourceRecords?.map(
+              (recordValue) => {
+                const ipv6full = IPv6.fromHexadecimalString(recordValue.Value);
+                const ipv6interface = IPv6.fromBigInteger(
+                  ipv6mask.and(ipv6full.value)
+                );
+                const ipv6new = IPv6.fromBigInteger(
+                  ipv6rangeFirst.add(ipv6interface.value)
+                );
+                return { Value: ipv6new.toString() };
+              }
             );
-            const ipv6new = IPv6.fromBigInteger(
-              ipv6rangeFirst.add(ipv6interface.value)
-            );
-            return { Value: ipv6new.toString() };
-          }
-        );
-        let newRecord = record;
-        newRecord.ResourceRecords = newResourceRecords;
-        return newRecord;
-      });
-
-      const changes = data
-        .filter((r) => r.Type === "AAAA")
-        .map((r) => {
-          return {
-            Action: "UPSERT",
-            ResourceRecordSet: r,
-          };
+            let newRecord = record;
+            newRecord.ResourceRecords = newResourceRecords;
+            return newRecord;
+          })
+        )
+        .then((currentRecords) => {
+          const changes = currentRecords
+            .filter((r) => r.Type === "AAAA")
+            .map((r) => {
+              return {
+                Action: "UPSERT",
+                ResourceRecordSet: r,
+              };
+            });
+          console.info(
+            "CHANGED RECORD SET\n" + JSON.stringify(changes, null, 2)
+          );
+          return changes;
         });
-      console.info("CHANGED RECORD SET\n" + JSON.stringify(changes, null, 2));
       changeResults.push(
-        route53
-          .changeResourceRecordSets({
-            HostedZoneId: zoneId,
-            ChangeBatch: {
-              Changes: changes,
-            },
-          })
-          .promise()
-          .then((resp) => {
-            console.info("CHANGE INFO\n" + JSON.stringify(resp, null, 2));
-            return resp;
-          })
-          .catch((error) => {
-            console.error("CHANGE ERROR\n" + JSON.stringify(error, null, 2));
-            return error;
-          })
+        changesPromise.then((changes) =>
+          route53
+            .changeResourceRecordSets({
+              HostedZoneId: zoneId,
+              ChangeBatch: {
+                Changes: changes,
+              },
+            })
+            .promise()
+            .then((resp) => {
+              console.info("CHANGE INFO\n" + JSON.stringify(resp, null, 2));
+              return resp;
+            })
+            .catch((error) => {
+              console.error("CHANGE ERROR\n" + JSON.stringify(error, null, 2));
+              return error;
+            })
+        )
       );
     }
 
