@@ -257,43 +257,45 @@ const handler = new aws.lambda.CallbackFunction("update-dns-lambda-callback", {
       );
     }
 
-    const response = await Promise.all(changeResults).then((results) =>
-      route53
-        .listResourceRecordSets({
-          HostedZoneId: zoneId,
-        })
-        .promise()
-        .then((resp) =>
-          resp.ResourceRecordSets.filter(
-            (record) =>
-              (record.Type === "A" || record.Type === "AAAA") &&
-              record.Name.includes(hostname)
+    return Promise.all(changeResults)
+      .then((results) =>
+        route53
+          .listResourceRecordSets({
+            HostedZoneId: zoneId,
+          })
+          .promise()
+          .then((resp) =>
+            resp.ResourceRecordSets.filter(
+              (record) =>
+                (record.Type === "A" || record.Type === "AAAA") &&
+                record.Name.includes(hostname)
+            )
           )
-        )
-        .then((finalRecords) => {
-          const responseData = {
-            parameter: {
-              hostname: hostname,
-              ip: ip,
-              ip6: ip6,
-            },
-            action: action,
-            records: finalRecords,
-          };
+          .then((finalRecords) => {
+            const responseData = {
+              parameter: {
+                hostname: hostname,
+                ip: ip,
+                ip6: ip6,
+              },
+              action: action,
+              records: finalRecords,
+            };
 
-          console.info("RESPONSE\n" + JSON.stringify(responseData, null, 2));
-          return responseData;
-        })
-        .catch((error) => {
-          console.error("ERROR\n" + JSON.stringify(error, null, 2));
-          return error;
-        })
-    );
-
-    return {
-      statusCode: 200,
-      body: JSON.stringify(response),
-    };
+            console.info("RESPONSE\n" + JSON.stringify(responseData, null, 2));
+            return {
+              statusCode: 200,
+              body: JSON.stringify(responseData),
+            };
+          })
+      )
+      .catch((error) => {
+        console.error("ERROR\n" + JSON.stringify(error, null, 2));
+        return {
+          statusCode: 500,
+          body: JSON.stringify(error),
+        };
+      });
   },
 });
 
