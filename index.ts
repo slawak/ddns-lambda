@@ -1,6 +1,7 @@
 import * as pulumi from "@pulumi/pulumi";
 import * as aws from "@pulumi/aws";
 import * as awsx from "@pulumi/awsx";
+import * as awssdk from "aws-sdk";
 import * as bcryptjs from "bcryptjs";
 import * as _ from "lodash";
 import { isIPv4, isIPv6 } from "net";
@@ -64,6 +65,56 @@ const updateDnsRolePolicy = new aws.iam.RolePolicy("update-dns-role-policy", {
   }),
 });
 
+const checkQueryParams = (event: awsx.apigateway.Request) => {
+  const hostname = event.queryStringParameters?.hostname;
+  const ip = event.queryStringParameters?.ip;
+  const ip6 = event.queryStringParameters?.ip6;
+  const ip6lanprefix = event.queryStringParameters?.ip6lanprefix;
+
+  if (!hostname)
+    return {
+      statusCode: 404,
+      body: JSON.stringify({
+        message: "parameter hostname required",
+      }),
+    };
+  const hostnameRegex = `\\w+\\.${_.escapeRegExp(domain)}`;
+  if (!hostname.match(hostnameRegex))
+    return {
+      statusCode: 404,
+      body: JSON.stringify({
+        message: "parameter hostname malformed",
+      }),
+    };
+  if (ip && !isIPv4(ip))
+    return {
+      statusCode: 404,
+      body: JSON.stringify({
+        message: "parameter ip malformed",
+      }),
+    };
+  if (ip6 && !isIPv6(ip6))
+    return {
+      statusCode: 404,
+      body: JSON.stringify({
+        message: "parameter ip6 malformed",
+      }),
+    };
+  if (ip6lanprefix && !Validator.isValidIPv6CidrRange(ip6lanprefix))
+    return {
+      statusCode: 404,
+      body: JSON.stringify({
+        message: "parameter ip6lanprefix malformed",
+      }),
+    };
+  return {
+    hostname: hostname,
+    ip: ip,
+    ip6: ip6,
+    ip6lanprefix: ip6lanprefix,
+  };
+};
+
 const handler = new aws.lambda.CallbackFunction("update-dns-lambda-callback", {
   role: updateDnsRole,
   callback: async (event: awsx.apigateway.Request) => {
@@ -71,50 +122,27 @@ const handler = new aws.lambda.CallbackFunction("update-dns-lambda-callback", {
       "QUERY STRING PARAMETERS\n" +
         JSON.stringify(event.queryStringParameters, null, 2)
     );
-    const hostname = event.queryStringParameters?.hostname;
-    const ip = event.queryStringParameters?.ip;
-    const ip6 = event.queryStringParameters?.ip6;
-    const ip6lanprefix = event.queryStringParameters?.ip6lanprefix;
 
-    if (!hostname)
-      return {
-        statusCode: 404,
-        body: JSON.stringify({
-          message: "parameter hostname required",
-        }),
-      };
-    const hostnameRegex = `\\w+\\.${_.escapeRegExp(domain)}`;
-    if (!hostname.match(hostnameRegex))
-      return {
-        statusCode: 404,
-        body: JSON.stringify({
-          message: "parameter hostname malformed",
-        }),
-      };
-    if (ip && !isIPv4(ip))
-      return {
-        statusCode: 404,
-        body: JSON.stringify({
-          message: "parameter ip malformed",
-        }),
-      };
-    if (ip6 && !isIPv6(ip6))
-      return {
-        statusCode: 404,
-        body: JSON.stringify({
-          message: "parameter ip6 malformed",
-        }),
-      };
-    if (ip6lanprefix && !Validator.isValidIPv6CidrRange(ip6lanprefix))
-      return {
-        statusCode: 404,
-        body: JSON.stringify({
-          message: "parameter ip6lanprefix malformed",
-        }),
-      };
+    const checkResult = checkQueryParams(event);
+    if (checkResult.statusCode == 404) {
+      return checkResult;
+    }
+    const hostname = checkResult.hostname as string;
+    const ip = checkResult.ip;
+    const ip6 = checkResult.ip6;
+    const ip6lanprefix = checkResult.ip6lanprefix;
     const action = ip || ip6 || ip6lanprefix ? "UPDATE" : "GET";
 
     const route53 = new aws.sdk.Route53();
+
+    var changeResults: Array<
+      Promise<
+        awssdk.Request<
+          awssdk.Route53.ChangeResourceRecordSetsResponse,
+          awssdk.AWSError
+        >
+      >
+    > = [];
 
     if (ip || ip6) {
       const records = [
@@ -137,15 +165,24 @@ const handler = new aws.lambda.CallbackFunction("update-dns-lambda-callback", {
         };
       });
       console.info("CHANGED RECORD SET\n" + JSON.stringify(changes, null, 2));
-      const changedRecordSet = await route53
-        .changeResourceRecordSets({
-          HostedZoneId: zoneId,
-          ChangeBatch: {
-            Changes: changes,
-          },
-        })
-        .promise();
-      console.info("CHANGE INFO\n" + JSON.stringify(changedRecordSet, null, 2));
+      changeResults.push(
+        route53
+          .changeResourceRecordSets({
+            HostedZoneId: zoneId,
+            ChangeBatch: {
+              Changes: changes,
+            },
+          })
+          .promise()
+          .then((resp) => {
+            console.info("CHANGE INFO\n" + JSON.stringify(resp, null, 2));
+            return resp;
+          })
+          .catch((error) => {
+            console.error("CHANGE ERROR\n" + JSON.stringify(error, null, 2));
+            return error;
+          })
+      );
     }
 
     if (ip6lanprefix) {
@@ -192,41 +229,58 @@ const handler = new aws.lambda.CallbackFunction("update-dns-lambda-callback", {
           };
         });
       console.info("CHANGED RECORD SET\n" + JSON.stringify(changes, null, 2));
-      const changedRecordSet = await route53
-        .changeResourceRecordSets({
-          HostedZoneId: zoneId,
-          ChangeBatch: {
-            Changes: changes,
-          },
-        })
-        .promise();
-      console.info("CHANGE INFO\n" + JSON.stringify(changedRecordSet, null, 2));
+      changeResults.push(
+        route53
+          .changeResourceRecordSets({
+            HostedZoneId: zoneId,
+            ChangeBatch: {
+              Changes: changes,
+            },
+          })
+          .promise()
+          .then((resp) => {
+            console.info("CHANGE INFO\n" + JSON.stringify(resp, null, 2));
+            return resp;
+          })
+          .catch((error) => {
+            console.error("CHANGE ERROR\n" + JSON.stringify(error, null, 2));
+            return error;
+          })
+      );
     }
 
-    const finalRecords = await route53
-      .listResourceRecordSets({
-        HostedZoneId: zoneId,
-      })
-      .promise()
-      .then((resp) =>
-        resp.ResourceRecordSets.filter(
-          (record) =>
-            (record.Type === "A" || record.Type === "AAAA") &&
-            record.Name.includes(hostname)
+    const response = await Promise.all(changeResults).then((results) =>
+      route53
+        .listResourceRecordSets({
+          HostedZoneId: zoneId,
+        })
+        .promise()
+        .then((resp) =>
+          resp.ResourceRecordSets.filter(
+            (record) =>
+              (record.Type === "A" || record.Type === "AAAA") &&
+              record.Name.includes(hostname)
+          )
         )
-      );
+        .then((finalRecords) => {
+          const responseData = {
+            parameter: {
+              hostname: hostname,
+              ip: ip,
+              ip6: ip6,
+            },
+            action: action,
+            records: finalRecords,
+          };
 
-    const response = {
-      parameter: {
-        hostname: hostname,
-        ip: ip,
-        ip6: ip6,
-      },
-      action: action,
-      records: finalRecords,
-    };
-
-    console.info("RESPONSE\n" + JSON.stringify(response, null, 2));
+          console.info("RESPONSE\n" + JSON.stringify(responseData, null, 2));
+          return responseData;
+        })
+        .catch((error) => {
+          console.error("ERROR\n" + JSON.stringify(error, null, 2));
+          return error;
+        })
+    );
 
     return {
       statusCode: 200,
