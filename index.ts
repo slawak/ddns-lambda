@@ -258,37 +258,56 @@ const handler = new aws.lambda.CallbackFunction("update-dns-lambda-callback", {
     }
 
     return Promise.all(changeResults)
-      .then((results) =>
-        route53
-          .listResourceRecordSets({
-            HostedZoneId: zoneId,
-          })
-          .promise()
-          .then((resp) =>
-            resp.ResourceRecordSets.filter(
-              (record) =>
-                (record.Type === "A" || record.Type === "AAAA") &&
-                record.Name.includes(hostname)
+      .then((results) => {
+        if (action == "GET") {
+          return route53
+            .listResourceRecordSets({
+              HostedZoneId: zoneId,
+            })
+            .promise()
+            .then((resp) =>
+              resp.ResourceRecordSets.filter(
+                (record) =>
+                  (record.Type === "A" || record.Type === "AAAA") &&
+                  record.Name.includes(hostname)
+              )
             )
-          )
-          .then((finalRecords) => {
-            const responseData = {
-              parameter: {
-                hostname: hostname,
-                ip: ip,
-                ip6: ip6,
-              },
-              action: action,
-              records: finalRecords,
-            };
+            .then((finalRecords) => {
+              const responseData = {
+                parameter: {
+                  hostname: hostname,
+                  ip: ip,
+                  ip6: ip6,
+                },
+                action: action,
+                records: finalRecords,
+              };
 
-            console.info("RESPONSE\n" + JSON.stringify(responseData, null, 2));
-            return {
-              statusCode: 200,
-              body: JSON.stringify(responseData),
-            };
-          })
-      )
+              console.info(
+                "RESPONSE\n" + JSON.stringify(responseData, null, 2)
+              );
+              return {
+                statusCode: 200,
+                body: JSON.stringify(responseData),
+              };
+            });
+        } else {
+          const responseData = {
+            parameter: {
+              hostname: hostname,
+              ip: ip,
+              ip6: ip6,
+            },
+            action: action,
+          };
+
+          console.info("RESPONSE\n" + JSON.stringify(responseData, null, 2));
+          return {
+            statusCode: 200,
+            body: JSON.stringify(responseData),
+          };
+        }
+      })
       .catch((error) => {
         console.error("ERROR\n" + JSON.stringify(error, null, 2));
         return {
